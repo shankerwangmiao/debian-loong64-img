@@ -1,0 +1,172 @@
+name: Generate Image
+
+on:
+  push:
+
+jobs:
+  build:
+    env:
+      MIRROR: "http://ftp.ports.debian.org/debian-ports"
+      SUIT: "sid"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install --no-install-recommends -y debootstrap gdisk dosfstools e2fsprogs debian-ports-archive-keyring qemu-user-static zstd
+      - name: Initialize VM Disk
+        run: |
+          truncate -s 4G disk.img
+          sgdisk --zap-all \
+                 --new=2:2048:+1048576 --typecode=2:EF00 \
+                 --new=1:0:0 --typecode=1:8300 \
+                 -- disk.img
+          loop_dev=$(sudo losetup --show -fP disk.img)
+          echo "loop_dev=${loop_dev}" >> $GITHUB_ENV
+          sudo mkfs.vfat -F 32 -n EFI "${loop_dev}p2"
+          sudo mkfs.ext4 "${loop_dev}p1"
+          sudo mkdir -p mnt
+          sudo mount "${loop_dev}p1" mnt
+          sudo mkdir -p mnt/boot/efi
+          sudo mount "${loop_dev}p2" mnt/boot/efi
+      - name: Bootstrap OS
+        run: |
+          sudo debootstrap \
+            --arch=loong64 --foreign --merged-usr \
+            --components=main,contrib,non-free,non-free-firmware \
+            --extra-suites=unreleased \
+            --include=gnupg,locales,tzdata,debian-ports-archive-keyring \
+            --keyring=/usr/share/keyrings/debian-ports-archive-keyring.gpg \
+            "$SUIT" mnt "$MIRROR"
+          sudo chroot mnt /debootstrap/debootstrap --second-stage
+      - name: Bind mount proc, sys, dev
+        run: |
+          for i in proc sys dev; do
+            sudo mount --rbind /$i mnt/$i
+            sudo mount --make-rslave mnt/$i
+          done
+          sudo mount -t tmpfs tmpfs mnt/run
+      - name: Prepare to configure
+        run: |
+          cat > /tmp/func << 'EOF'
+          export LANG=C
+          in-root(){
+            sudo chroot mnt/ "$@"
+          }
+          EOF
+      - name: Post install configuration
+        run: |
+          . /tmp/func
+          in-root debconf-set-selections <<EOF
+          locales	locales/locales_to_be_generated	multiselect	en_US.UTF-8 UTF-8, zh_CN.UTF-8 UTF-8
+          locales	locales/default_environment_locale	select	en_US.UTF-8
+          tzdata	tzdata/Areas	select	Asia
+          tzdata	tzdata/Zones/Asia	select	Shanghai
+          EOF
+          in-root rm -f "/etc/locale.gen"
+          in-root ln -fs /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          sudo mkdir -p mnt/var/lib/locales/supported.d/
+          echo "zh_CN.UTF-8 UTF-8" | sudo tee mnt/var/lib/locales/supported.d/zh-hans  > /dev/null
+          in-root dpkg-reconfigure --frontend noninteractive locales < /dev/null
+          in-root dpkg-reconfigure --frontend noninteractive tzdata < /dev/null
+          sudo tee mnt/etc/apt/sources.list << EOF
+          deb $MIRROR $SUIT main non-free contrib non-free-firmware
+          deb-src $MIRROR $SUIT main non-free contrib non-free-firmware
+          EOF
+
+      - name: Install additional softwares
+        run: |
+          . /tmp/func
+          in-root apt-get update
+          in-root apt-get dist-upgrade -y --no-install-recommends
+          in-root apt-get install -y --no-install-recommends \
+            linux-image-loong64 \
+            bash-completion \
+            bind9-dnsutils \
+            bind9-host \
+            busybox-static \
+            bzip2 \
+            ca-certificates \
+            console-setup \
+            curl \
+            dmsetup \
+            eject \
+            ethtool \
+            file \
+            grub-efi-loong64 \
+            initramfs-tools \
+            iperf3 \
+            keyboard-configuration \
+            libnss-systemd \
+            libpam-systemd \
+            locales \
+            lsof \
+            netcat-openbsd \
+            openssh-client \
+            openssh-server \
+            strace \
+            systemd \
+            systemd-resolved \
+            systemd-sysv \
+            systemd-timesyncd \
+            unattended-upgrades \
+            util-linux-extra \
+            vim \
+            wget \
+            xz-utils \
+            zstd
+
+      - name: Install bootloader
+        run: |
+          . /tmp/func
+          in-root grub-install --efi-directory=/boot/efi --removable
+          in-root update-grub
+
+      - name: Generate fstab
+        run: |
+          . /tmp/func
+          in-root tee /etc/fstab << EOF
+          UUID=$(sudo blkid --match-tag "UUID" --output "value" "${loop_dev}p1") /               ext4    errors=remount-ro 0       1
+          UUID=$(sudo blkid --match-tag "UUID" --output "value" "${loop_dev}p2")  /boot/efi       vfat    umask=0077      0       1
+          EOF
+          in-root bash -c "if [ -e "/usr/share/systemd/tmp.mount" ]; then cp /usr/share/systemd/tmp.mount /etc/systemd/system/; fi"
+          in-root systemctl enable tmp.mount
+
+      - name: Unmount
+        run: |
+          . /tmp/func
+          in-root sha256sum $(in-root find  /var/lib/containers -type f)
+          in-root apt-get clean
+          in-root bash -c "rm -f /etc/ssh/ssh*key*"
+          in-root rm -f "/etc/hostname"
+          in-root truncate -s 0 /etc/machine-id
+          sync -f mnt/
+          sudo umount -R mnt
+          sudo losetup -d "${loop_dev}"
+          sync disk.img
+          sha256sum disk.img
+          zstdmt --rm disk.img
+          sha256sum disk.img.zst
+
+      - name: Upload disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: disk.img.zst
+          path: disk.img.zst
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: disk.img.zst
+      - name: Create Release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: disk.img.zst
